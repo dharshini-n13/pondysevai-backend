@@ -4,6 +4,7 @@ Layer 1: MiniLM sentence-transformers (cosine similarity, CPU-only)
 Layer 2: Claude API (natural language profile assessment)
 """
 import json
+import traceback
 import numpy as np
 from typing import Optional
 from anthropic import Anthropic
@@ -19,8 +20,10 @@ _model = None
 def _get_model():
     global _model
     if _model is None:
+        print("[AI matching] Loading SentenceTransformer model...")
         from sentence_transformers import SentenceTransformer
         _model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        print("[AI matching] Model loaded successfully.")
     return _model
 
 def _build_profile_text(volunteer: dict) -> str:
@@ -44,39 +47,50 @@ def compute_role_matches(volunteer: dict) -> list[dict]:
     """
     Layer 1: MiniLM matching.
     Returns list of {role_id, role_name, dept, score} sorted by score desc.
-    Only includes scores >= 0.65. High-demand roles filtered if mobility_impairment.
+    Only includes scores >= 0.45. High-demand roles filtered if mobility_impairment.
     """
-    db = get_supabase()
-    roles_result = db.table("roles").select("*").execute()
-    roles = roles_result.data
+    try:
+        db = get_supabase()
+        roles_result = db.table("roles").select("*").execute()
+        roles = roles_result.data
 
-    if not roles:
+        print(f"[AI matching] Found {len(roles)} roles in database.")
+
+        if not roles:
+            print("[AI matching] No roles found — skipping matching.")
+            return []
+
+        model = _get_model()
+        profile_text = _build_profile_text(volunteer)
+        print(f"[AI matching] Profile text: {profile_text}")
+        profile_vec = model.encode(profile_text, normalize_embeddings=True)
+
+        scored = []
+        for role in roles:
+            # Hard filter: skip high-demand roles for mobility-impaired volunteers
+            if volunteer.get("mobility_impairment") and role.get("demand") == "high":
+                continue
+
+            role_text = f"{role['name']}. Required qualifications: {role.get('qualifications', '')}. Department: {role.get('dept_name', '')}"
+            role_vec = model.encode(role_text, normalize_embeddings=True)
+            score = _cosine_similarity(profile_vec, role_vec)
+
+            if score >= 0.45:
+                scored.append({
+                    "role_id": role["id"],
+                    "role_name": role["name"],
+                    "dept": role.get("dept_name", ""),
+                    "demand": role.get("demand", ""),
+                    "score": round(score, 4),
+                })
+
+        print(f"[AI matching] {len(scored)} roles matched above threshold 0.45.")
+        return sorted(scored, key=lambda x: x["score"], reverse=True)[:5]
+
+    except Exception as e:
+        print(f"[AI matching] Error in compute_role_matches: {e}")
+        traceback.print_exc()
         return []
-
-    model = _get_model()
-    profile_text = _build_profile_text(volunteer)
-    profile_vec = model.encode(profile_text, normalize_embeddings=True)
-
-    scored = []
-    for role in roles:
-        # Hard filter: skip high-demand roles for mobility-impaired volunteers
-        if volunteer.get("mobility_impairment") and role.get("demand") == "high":
-            continue
-
-        role_text = f"{role['name']}. {role.get('description', '')}. Required: {role.get('qualifications', '')}"
-        role_vec = model.encode(role_text, normalize_embeddings=True)
-        score = _cosine_similarity(profile_vec, role_vec)
-
-        if score >= 0.45:
-            scored.append({
-                "role_id": role["id"],
-                "role_name": role["name"],
-                "dept": role.get("dept_name", ""),
-                "demand": role.get("demand", ""),
-                "score": round(score, 4),
-            })
-
-    return sorted(scored, key=lambda x: x["score"], reverse=True)[:5]
 
 def generate_claude_assessment(volunteer: dict, top_matches: list[dict]) -> str:
     """
@@ -114,39 +128,54 @@ Top matched roles:
 
 Write the assessment in English, 2-3 sentences only."""
 
-    response = _anthropic.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text.strip()
+    try:
+        response = _anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"[AI matching] Claude API error: {e}")
+        traceback.print_exc()
+        return f"AI narrative unavailable. Top match: {top_matches[0]['role_name']} ({top_matches[0]['dept']})."
 
 def run_full_assessment(volunteer_id: str) -> dict:
     """
     Full pipeline: fetch volunteer → MiniLM matching → Claude assessment → save to DB.
     Called as a background job after registration.
     """
-    db = get_supabase()
-    vol_result = db.table("volunteers").select("*").eq("id", volunteer_id).execute()
-    if not vol_result.data:
-        return {"error": "Volunteer not found"}
+    try:
+        print(f"[AI matching] Starting assessment for volunteer {volunteer_id}")
+        db = get_supabase()
+        vol_result = db.table("volunteers").select("*").eq("id", volunteer_id).execute()
+        if not vol_result.data:
+            print(f"[AI matching] Volunteer {volunteer_id} not found.")
+            return {"error": "Volunteer not found"}
 
-    volunteer = vol_result.data[0]
-    top_matches = compute_role_matches(volunteer)
-    ai_score = top_matches[0]["score"] if top_matches else 0.0
-    assessment = generate_claude_assessment(volunteer, top_matches)
+        volunteer = vol_result.data[0]
+        top_matches = compute_role_matches(volunteer)
+        ai_score = top_matches[0]["score"] if top_matches else 0.0
+        assessment = generate_claude_assessment(volunteer, top_matches)
 
-    # Save assessment back to volunteer record
-    db.table("volunteers").update({
-        "ai_assessment": assessment,
-        "ai_score": ai_score,
-        "ai_top_matches": json.dumps(top_matches),
-        "status": "pending_review",
-    }).eq("id", volunteer_id).execute()
+        print(f"[AI matching] Score: {ai_score}, Matches: {len(top_matches)}, Assessment: {assessment[:80]}")
 
-    return {
-        "volunteer_id": volunteer_id,
-        "top_matches": top_matches,
-        "ai_score": ai_score,
-        "assessment": assessment,
-    }
+        # Save assessment back to volunteer record
+        db.table("volunteers").update({
+            "ai_assessment": assessment,
+            "ai_score": ai_score,
+            "ai_top_matches": json.dumps(top_matches),
+            "status": "pending_review",
+        }).eq("id", volunteer_id).execute()
+
+        print(f"[AI matching] Assessment saved for volunteer {volunteer_id}")
+        return {
+            "volunteer_id": volunteer_id,
+            "top_matches": top_matches,
+            "ai_score": ai_score,
+            "assessment": assessment,
+        }
+    except Exception as e:
+        print(f"[AI matching] Fatal error in run_full_assessment: {e}")
+        traceback.print_exc()
+        return {"error": str(e)}
