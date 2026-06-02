@@ -76,7 +76,9 @@ def _run_ai_assessment(volunteer_id: str):
         from app.services.ai_matching import run_full_assessment
         run_full_assessment(volunteer_id)
     except Exception as e:
+        import traceback
         print(f"[AI assessment error] volunteer {volunteer_id}: {e}")
+        traceback.print_exc()
 
 @router.get("/me", response_model=VolunteerOut)
 def get_my_profile(user: dict = Depends(get_current_user)):
