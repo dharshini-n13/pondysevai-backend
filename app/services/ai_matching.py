@@ -67,7 +67,7 @@ def compute_role_matches(volunteer: dict) -> list[dict]:
         role_vec = model.encode(role_text, normalize_embeddings=True)
         score = _cosine_similarity(profile_vec, role_vec)
 
-        if score >= 0.65:
+        if score >= 0.45:
             scored.append({
                 "role_id": role["id"],
                 "role_name": role["name"],
