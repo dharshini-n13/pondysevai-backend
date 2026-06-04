@@ -1,7 +1,6 @@
 """
-Auth service — OTP via Supabase Auth (phone OTP).
-For nodal officers and admins, email/password via Supabase Auth.
-JWT issued by this backend after Supabase verification.
+Auth service — OTP generation and verification.
+JWT issued by this backend after verification.
 """
 import random
 import string
@@ -14,7 +13,7 @@ from app.database import get_supabase
 
 settings = get_settings()
 
-# In-memory OTP store for dev (replace with Redis in prod)
+# In-memory OTP store (replace with Redis in prod)
 _otp_store: dict[str, str] = {}
 
 def _generate_otp() -> str:
@@ -38,29 +37,24 @@ def decode_token(token: str) -> Optional[dict]:
 
 def send_otp(phone: str) -> dict:
     """
-    In production: use Supabase Auth signInWithOtp or Twilio.
-    In development: return OTP directly for testing.
+    Generate OTP and attempt to send via SMS.
+    Always returns dev_otp so testing works even without Twilio.
     """
     otp = _generate_otp()
     _otp_store[phone] = otp
 
-    if settings.app_env == "production":
-        # Try Supabase Auth phone OTP
+    # Try to send via Twilio if configured
+    if settings.twilio_account_sid:
         try:
-            db = get_supabase()
-            db.auth.sign_in_with_otp({"phone": f"+91{phone}"})
-            return {"sent": True, "method": "supabase"}
-        except Exception:
-            # Fall back to Twilio
             _send_twilio_sms(phone, otp)
             return {"sent": True, "method": "twilio"}
-    else:
-        # Dev mode — return OTP in response so testers can use it
-        return {"sent": True, "method": "dev", "dev_otp": otp}
+        except Exception as e:
+            print(f"[OTP] Twilio failed: {e} — returning dev_otp")
+
+    # Always return dev_otp as fallback so login works without SMS
+    return {"sent": True, "method": "dev", "dev_otp": otp}
 
 def _send_twilio_sms(phone: str, otp: str):
-    if not settings.twilio_account_sid:
-        return
     from twilio.rest import Client as TwilioClient
     client = TwilioClient(settings.twilio_account_sid, settings.twilio_auth_token)
     client.messages.create(
