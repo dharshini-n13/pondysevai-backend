@@ -1,9 +1,20 @@
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional
 from app.database import get_supabase
 from app.routers.auth import require_role
 from app.services.notifications import bulk_sms
+import uuid
 
 router = APIRouter(prefix="/nodal-officer", tags=["nodal-officer"])
+
+class AssignRequest(BaseModel):
+    role: str
+    dept: str
+    location: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    shift: Optional[str] = None
+    role_id: Optional[str] = None
 
 @router.get("/applicants")
 def get_applicants(
@@ -15,7 +26,7 @@ def get_applicants(
     """Get all applicants with AI scores, filtered by status/commune/dept."""
     db = get_supabase()
     query = db.table("volunteers").select(
-        "id,full_name,phone,commune,status,ai_score,ai_assessment,ai_top_matches,assigned_role,assigned_dept,tier,latest_feedback,created_at"
+        "id,full_name,phone,commune,status,ai_score,ai_assessment,ai_top_matches,assigned_role,assigned_dept,tier,latest_feedback,created_at,departments"
     )
     if status:
         query = query.eq("status", status)
@@ -27,17 +38,18 @@ def get_applicants(
 @router.post("/assign/{volunteer_id}")
 def assign_volunteer(
     volunteer_id: str,
-    role: str,
-    dept: str,
+    body: AssignRequest,
     background_tasks: BackgroundTasks,
     user: dict = Depends(require_role("nodal_officer", "admin")),
 ):
-    """Assign a volunteer to a role and department."""
+    """Assign a volunteer to a role, department, and optionally create a deployment."""
     db = get_supabase()
+
+    # Update volunteer status
     result = db.table("volunteers").update({
         "status": "assigned",
-        "assigned_role": role,
-        "assigned_dept": dept,
+        "assigned_role": body.role,
+        "assigned_dept": body.dept,
         "assigned_by": user["sub"],
     }).eq("id", volunteer_id).execute()
 
@@ -45,11 +57,29 @@ def assign_volunteer(
         raise HTTPException(404, "Volunteer not found")
 
     v = result.data[0]
+
+    # Create deployment record if shift details provided
+    deployment_id = None
+    if body.location and body.scheduled_date and body.shift:
+        dep_result = db.table("deployments").insert({
+            "id": str(uuid.uuid4()),
+            "volunteer_id": volunteer_id,
+            "role_id": body.role_id or "r01",
+            "location": body.location,
+            "scheduled_date": body.scheduled_date,
+            "shift": body.shift,
+            "status": "scheduled",
+            "assigned_by": user["sub"],
+        }).execute()
+        if dep_result.data:
+            deployment_id = dep_result.data[0]["id"]
+
     background_tasks.add_task(
         bulk_sms, [v["phone"]], "application_assigned", "en",
-        role=role, dept=dept
+        role=body.role, dept=body.dept
     )
-    return {"assigned": True, "volunteer": v}
+
+    return {"assigned": True, "volunteer": v, "deployment_id": deployment_id}
 
 @router.post("/reject/{volunteer_id}")
 def reject_volunteer(
